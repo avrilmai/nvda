@@ -320,12 +320,14 @@ class TestQueueReader(unittest.TestCase):
 		self.queued = Event()
 		self.callbacks = []
 		self.received = []
+		callbacks = self.callbacks
+		queued = self.queued
 
 		class DeferredIoThread:
-			def queueAsApc(innerSelf, callback, param=0):
-				self.callbacks.append((weakref.ref(callback), param))
-				if len(self.callbacks) == 2:
-					self.queued.set()
+			def queueAsApc(self, callback, param=0):
+				callbacks.append((weakref.ref(callback), param))
+				if len(callbacks) == 2:
+					queued.set()
 
 		self.reader = Thread(
 			target=queueReader,
