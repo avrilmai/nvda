@@ -278,7 +278,8 @@ class BrailleDisplayDriver(driverHandler.Driver):
 			port = f"{cls._BLE_PORT_PREFIX}{match.id}@{match.port}"
 			# Translators: Name of a Bluetooth Low Energy braille display port
 			description = _("Bluetooth: {deviceName} ({address})").format(
-				deviceName=match.id, address=match.port
+				deviceName=match.id,
+				address=match.port,
 			)
 			yield port, description
 

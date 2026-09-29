@@ -339,7 +339,10 @@ class TestDotPadBle(unittest.TestCase):
 			mockPump.return_value.funcRes = True
 			self.assertTrue(driver._tryConnect(self._ADDRESS, bdDetect.ProtocolType.BLE, portInfo))
 		mockPump.assert_called_once_with(
-			driver._tryConnect, self._ADDRESS, bdDetect.ProtocolType.BLE, portInfo
+			driver._tryConnect,
+			self._ADDRESS,
+			bdDetect.ProtocolType.BLE,
+			portInfo,
 		)
 
 	def test_tryConnect_bleDeviceNotDiscovered(self) -> None:

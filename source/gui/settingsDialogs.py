@@ -5373,7 +5373,10 @@ class BrailleDisplaySelectionDialog(SettingsDialog):
 		"""Release this dialog's scan without interrupting automatic detection."""
 		if self._bleScanExecutor is not None:
 			self._bleScanExecutor.submit(
-				self._updateBleScanLease, self._bleScanner, self._bleScanOwner, False
+				self._updateBleScanLease,
+				self._bleScanner,
+				self._bleScanOwner,
+				False,
 			)
 			self._bleScanExecutor.shutdown(wait=False)
 			self._bleScanExecutor = None
