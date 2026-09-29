@@ -204,7 +204,6 @@ class TestDotPadBufferedReceive(unittest.TestCase):
 		self.assertEqual(len(self.driver._receiveBuffer), 3)
 
 
-@unittest.skip("Requires BLE support from PR C (#19122)")
 class TestDotPadBle(unittest.TestCase):
 	"""Skipped tests for BLE-specific DotPad functionality.
 
