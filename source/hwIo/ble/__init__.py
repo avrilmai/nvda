@@ -15,13 +15,18 @@ Bluetooth Classic devices should be paired through Windows' Bluetooth settings a
 import time  # noqa: I001
 from bleak.exc import BleakError
 from bleak.backends.device import BLEDevice
+from winrt.windows.devices.bluetooth import BluetoothAdapter
+from winrt.windows.devices.radios import RadioState
+
+import _asyncioEventLoop
+from _asyncioEventLoop.utils import runCoroutineSync
 from logHandler import log
 
 from ._scanner import Scanner
 from ._io import Ble
 from ..base import requiresBackgroundThread
 
-__all__ = ["Ble", "Scanner", "findDeviceByAddress", "scanner"]
+__all__ = ["Ble", "Scanner", "findDeviceByAddress", "getDiscoveredDevice", "isAvailable", "scanner"]
 
 #: Module-level singleton scanner shared by all BLE consumers.
 #: Using a single scanner avoids contention over the Windows BLE stack and
@@ -41,10 +46,61 @@ def terminate() -> None:
 	"""Terminate the hwIo.ble module, stopping any active BLE scan and releasing the scanner."""
 	log.debug("Terminating BLE I/O")
 	global scanner
-	if scanner is not None:
-		if scanner.isScanning:
-			scanner.stop()
-		scanner = None
+	oldScanner = scanner
+	scanner = None
+	if oldScanner is not None:
+		try:
+			oldScanner.terminate()
+		except (BleakError, OSError, TimeoutError, RuntimeError):
+			# NVDA is shutting down, so there is nothing left to salvage.
+			log.debugWarning("Failed to stop BLE scanner", exc_info=True)
+
+
+AVAILABILITY_TIMEOUT_SECONDS: int = 5
+"""How long to wait for Windows to report on the Bluetooth hardware."""
+
+
+async def _isBluetoothUsable() -> bool:
+	"""Ask Windows whether this machine has Bluetooth hardware able to act as a central."""
+	adapter = await BluetoothAdapter.get_default_async()
+	if adapter is None or not adapter.is_central_role_supported:
+		return False
+	radio = await adapter.get_radio_async()
+	return radio.state == RadioState.ON
+
+
+def isAvailable() -> bool:
+	"""Determine whether this machine can reach BLE devices.
+
+	Answering takes a few milliseconds, as it asks the Bluetooth stack rather than
+	reading a cached value, so the answer also reflects the radio being switched off.
+
+	:return: ``False`` only when Windows reports there is no usable Bluetooth hardware.
+		Anything that prevents asking reports ``True``: hiding a driver on a machine
+		that may well support it is worse than offering one that cannot connect.
+	"""
+	if not _asyncioEventLoop.isRunning():
+		# There is nothing to ask on, such as in unit tests.
+		return True
+	try:
+		return runCoroutineSync(_isBluetoothUsable(), AVAILABILITY_TIMEOUT_SECONDS)
+	except (BleakError, OSError, TimeoutError, RuntimeError):
+		log.debugWarning("Could not determine whether Bluetooth is available", exc_info=True)
+		return True
+
+
+def getDiscoveredDevice(address: str) -> BLEDevice | None:
+	"""Get an already discovered BLE device by its address.
+
+	Unlike :func:`findDeviceByAddress` this never starts a scan and never blocks,
+	so it is safe to call on the main thread.
+
+	:param address: The BLE device address (MAC address)
+	:return: The BLE device object if the scanner has seen it, None otherwise
+	"""
+	if scanner is None:
+		return None
+	return next((device for device in scanner.results() if device.address == address), None)
 
 
 @requiresBackgroundThread
@@ -58,35 +114,34 @@ def findDeviceByAddress(address: str, timeout: float = 5.0, pollInterval: float 
 	:param pollInterval: How often to check results in seconds (default 0.1)
 	:return: The BLE device object if found, None otherwise
 	"""
-	if scanner is None:
+	sharedScanner = scanner
+	if sharedScanner is None:
 		raise RuntimeError("hwIo.ble.initialize() must be called before using findDeviceByAddress")
 	log.debug(f"Searching for BLE device with address {address}")
 
-	# Check if device already discovered
-	for device in scanner.results():
-		if device.address == address:
-			log.debug(f"Found BLE device {address} in existing results")
-			return device
+	device = getDiscoveredDevice(address)
+	if device is not None:
+		log.debug(f"Found BLE device {address} in existing results")
+		return device
 
-	# Not found - start scanning if not already running
-	if not scanner.isScanning:
-		try:
-			scanner.start()  # Start in background mode
-		except (BleakError, OSError):
-			log.error(f"Failed to start BLE scanner while searching for device {address}", exc_info=True)  # noqa: G201
-			return None
-
-	startTime = time.time()
-	while time.time() - startTime < timeout:
-		time.sleep(pollInterval)
-
-		# Check if device appeared
-		for device in scanner.results():
-			if device.address == address:
-				elapsed = time.time() - startTime
-				log.debug(f"Found BLE device {address} after {elapsed:.2f}s")
+	owner = object()
+	try:
+		sharedScanner.acquire(owner)
+	except (BleakError, OSError, TimeoutError, RuntimeError):
+		log.error(f"Failed to start BLE scanner while searching for device {address}", exc_info=True)  # noqa: G201
+		return None
+	try:
+		startTime = time.monotonic()
+		while time.monotonic() - startTime < timeout:
+			time.sleep(pollInterval)
+			device = getDiscoveredDevice(address)
+			if device is not None:
+				log.debug(f"Found BLE device {address} after {time.monotonic() - startTime:.2f}s")
 				return device
-
-	# Timeout - device not found
-	log.debug(f"BLE device {address} not found after {timeout}s timeout")
-	return None
+		log.debug(f"BLE device {address} not found after {timeout}s timeout")
+		return None
+	finally:
+		try:
+			sharedScanner.release(owner)
+		except (BleakError, OSError, TimeoutError, RuntimeError):
+			log.debugWarning("Failed to release BLE device discovery scan", exc_info=True)

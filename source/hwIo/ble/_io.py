@@ -6,7 +6,7 @@
 import time  # noqa: I001
 from itertools import count, takewhile
 from queue import Empty, Queue
-from threading import Event, Thread
+from threading import Event, Thread, current_thread
 from collections.abc import Callable, Iterator
 import weakref
 
@@ -21,6 +21,18 @@ from bleak.backends.characteristic import BleakGATTCharacteristic
 from bleak.backends.winrt.client import WinRTClientArgs
 
 CONNECT_TIMEOUT_SECONDS: int = 2
+"""How long to wait for the connection to be established and its services discovered."""
+
+LINK_TIMEOUT_SECONDS: int = 10
+"""How long to wait for the connection attempt itself, including any implicit discovery.
+
+A device that is switched off or out of range would otherwise hold the calling thread
+for as long as the Bluetooth stack keeps trying. That thread is NVDA's main thread when
+a configured display is connected during startup or from the braille settings dialog,
+so the wait has to be bounded. Use the same ten-second budget for Bleak's implicit
+discovery and for the synchronous caller instead of its longer default timeout.
+"""
+
 WINRT_CLIENT_ARGS = WinRTClientArgs(use_cached_services=True)
 
 
@@ -47,7 +59,16 @@ def queueReader(
 	:param stopEvent: Set by `Ble.close()` to make the loop exit.
 	:param ioThread: Shared NVDA I/O thread used to run `onReceive`.
 	"""
-	while True:
+	# IoThread keeps only a weak reference to its callbacks. Keep one callback alive
+	# for the reader's lifetime and identify each immutable packet by its APC parameter.
+	pending: dict[int, bytes] = {}
+
+	def apc(sequence: int) -> None:
+		data = pending.pop(sequence, None)
+		if data is not None and not stopEvent.is_set():
+			onReceive(data)
+
+	for sequence in count():
 		if stopEvent.is_set():
 			log.debug("Reader thread got stop event")
 			break
@@ -56,14 +77,15 @@ def queueReader(
 		except Empty:
 			continue
 
-		def apc(_x: int = 0):
-			return onReceive(data)  # noqa: B023
-
+		pending[sequence] = data
 		try:
-			ioThread.queueAsApc(apc)
-		except OSError:
+			ioThread.queueAsApc(apc, sequence)
+		except (OSError, RuntimeError):
+			pending.pop(sequence, None)
 			log.error("Reader thread failed to queue APC", exc_info=True)  # noqa: G201
-		queue.task_done()
+		finally:
+			queue.task_done()
+	pending.clear()
 
 
 def sliced(data: bytes, n: int) -> Iterator[bytes]:
@@ -97,7 +119,7 @@ class Ble(IoBase):
 	_onReceive: Callable[[bytes], None] | None
 	"The callback to call when data is received"
 
-	_queuedData: Queue[bytes | bytearray]
+	_queuedData: Queue[bytes]
 	"A queue of received data, this is processed by the onReceive handler"
 
 	_readEvent: Event
@@ -122,15 +144,24 @@ class Ble(IoBase):
 		onReceive: Callable[[bytes], None],
 		ioThread: IoThread | None = None,
 	) -> None:
+		self._closed = False
 		if isinstance(device, str):
 			# String address provided - Bleak will perform implicit discovery
 			address = device
 			log.info(f"Connecting to BLE device at address {address}")
-			self._client = bleak.BleakClient(address, winrt=WINRT_CLIENT_ARGS)
+			self._client = bleak.BleakClient(
+				address,
+				winrt=WINRT_CLIENT_ARGS,
+				timeout=LINK_TIMEOUT_SECONDS,
+			)
 		else:
 			# BLEDevice object provided (preferred)
 			log.info(f"Connecting to {device.name} ({device.address})")
-			self._client = bleak.BleakClient(device, winrt=WINRT_CLIENT_ARGS)
+			self._client = bleak.BleakClient(
+				device,
+				winrt=WINRT_CLIENT_ARGS,
+				timeout=LINK_TIMEOUT_SECONDS,
+			)
 		self._writeServiceUuid = writeServiceUuid
 		self._writeCharacteristicUuid = writeCharacteristicUuid
 		self._readServiceUuid = readServiceUuid
@@ -148,8 +179,17 @@ class Ble(IoBase):
 			daemon=True,
 		)
 		self._readerThread.start()
-		runCoroutineSync(self._initAndConnect())
-		self.waitForConnection(CONNECT_TIMEOUT_SECONDS)
+		try:
+			runCoroutineSync(self._initAndConnect(), LINK_TIMEOUT_SECONDS)
+			self.waitForConnection(CONNECT_TIMEOUT_SECONDS)
+		except Exception:
+			# The reader thread outlives a failed constructor, as nothing owns this
+			# instance to close it.
+			try:
+				self.close()
+			except (bleak.exc.BleakError, OSError, TimeoutError, RuntimeError):
+				log.debugWarning("Failed to clean up BLE connection", exc_info=True)
+			raise
 
 	async def _initAndConnect(self) -> None:
 		await self._client.connect()
@@ -184,19 +224,24 @@ class Ble(IoBase):
 		for s in sliced(data, characteristic.max_write_without_response_size):
 			runCoroutineSync(
 				self._client.write_gatt_char(characteristic, s, response=False),
+				LINK_TIMEOUT_SECONDS,
 			)
 
 	def close(self) -> None:
 		"""Disconnect the BLE peripheral and release resources."""
+		if getattr(self, "_closed", False):
+			return
+		self._closed = True
 		if _isDebug():
 			log.debug("Closing BLE connection")
-		if self._client.is_connected:
-			runCoroutineSync(self._client.disconnect())
-		self._queuedData.join()
 		self._stopReaderEvent.set()
-		self._readerThread.join()
-
-		self._onReceive = None
+		try:
+			if self._client.is_connected:
+				runCoroutineSync(self._client.disconnect(), LINK_TIMEOUT_SECONDS)
+		finally:
+			if current_thread() is not self._readerThread:
+				self._readerThread.join()
+			self._onReceive = None
 
 	def __del__(self):
 		"""Ensure the BLE connection is closed before object destruction."""
@@ -239,10 +284,12 @@ class Ble(IoBase):
 		raise RuntimeError("Connection timed out")
 
 	def _notifyReceive(self, _char: BleakGATTCharacteristic, data: bytearray):
+		if self._stopReaderEvent.is_set():
+			return
 		if _isDebug():
 			log.debug(f"Read: {data!r}")
 		self._readEvent.set()
-		self._queuedData.put(data)
+		self._queuedData.put(bytes(data))
 
 	def read(self, size: int = 1) -> bytes:
 		"""Not implemented for BLE.

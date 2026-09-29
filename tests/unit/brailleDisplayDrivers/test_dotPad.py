@@ -13,13 +13,17 @@ import functools  # noqa: I001
 import operator
 import struct
 import unittest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import bdDetect
 from brailleDisplayDrivers.dotPad.driver import BrailleDisplayDriver
 from brailleDisplayDrivers.dotPad.defs import (
+	BLE_SERVICE_UUID,
+	BLE_WRITE_CHARACTERISTIC_UUID,
+	BLE_READ_CHARACTERISTIC_UUID,
 	DP_CHECKSUM_BASE,
 	DP_Command,
+	DP_Features,
 	DP_MAX_PACKET_SIZE,
 	DP_MIN_PACKET_SIZE,
 	DP_PacketSyncByte,
@@ -204,42 +208,188 @@ class TestDotPadBufferedReceive(unittest.TestCase):
 		self.assertEqual(len(self.driver._receiveBuffer), 3)
 
 
-@unittest.skip("Requires BLE support from PR C (#19122)")
 class TestDotPadBle(unittest.TestCase):
-	"""Skipped tests for BLE-specific DotPad functionality.
+	"""Tests for BLE-specific DotPad functionality."""
 
-	These tests document the expected BLE behavior and will be unskipped
-	when the BLE driver integration lands in PR C.
-	"""
+	def setUp(self) -> None:
+		# Preserve registrations belonging to other tests or the test bootstrap.
+		self.registryPatch = patch.dict(bdDetect._driverDevices, clear=True)
+		self.registryPatch.start()
+		self.addCleanup(self.registryPatch.stop)
+		appPatch = patch("brailleDisplayDrivers.dotPad.driver.wx.GetApp", return_value=None)
+		appPatch.start()
+		self.addCleanup(appPatch.stop)
+
+	@staticmethod
+	def _bleMatch(deviceId: str) -> bdDetect.DeviceMatch:
+		"""Build a BLE DeviceMatch with the given id (device name or address)."""
+		return bdDetect.DeviceMatch(
+			bdDetect.ProtocolType.BLE,
+			deviceId,
+			"AA:BB:CC:DD:EE:FF",
+			{"name": deviceId, "address": "AA:BB:CC:DD:EE:FF"},
+		)
 
 	def test_isBleDotPad_matching(self) -> None:
-		"""_isBleDotPad returns True for a device ID starting with 'DotPad'."""
-		device = MagicMock()
-		device.name = "DotPad320"
-		self.assertTrue(BrailleDisplayDriver._isBleDotPad(device))
+		"""_isBleDotPad returns True for a device id starting with 'DotPad'."""
+		self.assertTrue(BrailleDisplayDriver._isBleDotPad(self._bleMatch("DotPad320")))
 
 	def test_isBleDotPad_nonMatching(self) -> None:
 		"""_isBleDotPad returns False for an unrelated device."""
-		device = MagicMock()
-		device.name = "SomeOtherDevice"
-		self.assertFalse(BrailleDisplayDriver._isBleDotPad(device))
+		self.assertFalse(BrailleDisplayDriver._isBleDotPad(self._bleMatch("SomeOtherDevice")))
 
-	def test_check_returnsTrue(self) -> None:
-		"""check() returns True so DotPad always appears in the display list."""
-		self.assertTrue(BrailleDisplayDriver.check())
+	def test_check_bluetoothAvailable(self) -> None:
+		"""Usable Bluetooth is enough on its own, as a device may be switched on later."""
+		with patch("hwIo.ble.isAvailable", return_value=True):
+			self.assertTrue(BrailleDisplayDriver.check())
+
+	def test_check_noBluetoothButDeviceReachable(self) -> None:
+		"""Without Bluetooth the driver still stands on its other connections."""
+		with (
+			patch("hwIo.ble.isAvailable", return_value=False),
+			patch("bdDetect.driverHasPossibleDevices", return_value=True),
+		):
+			self.assertTrue(BrailleDisplayDriver.check())
+
+	def test_check_nothingReachable(self) -> None:
+		"""With no Bluetooth and nothing connected there is nothing to offer."""
+		with (
+			patch("hwIo.ble.isAvailable", return_value=False),
+			patch("bdDetect.driverHasPossibleDevices", return_value=False),
+			patch.object(BrailleDisplayDriver, "getManualPorts", classmethod(lambda cls: iter(()))),
+		):
+			self.assertFalse(BrailleDisplayDriver.check())
+
+	def test_check_pumpsMessagesWhileQueryingBluetooth(self) -> None:
+		"""Opening the display list keeps processing messages during a slow Bluetooth query."""
+		with (
+			patch("brailleDisplayDrivers.dotPad.driver.wx.GetApp", return_value=object()),
+			patch("brailleDisplayDrivers.dotPad.driver.systemUtils.ExecAndPump") as mockPump,
+			patch("hwIo.ble.isAvailable") as mockAvailable,
+		):
+			mockPump.return_value.funcRes = True
+			self.assertTrue(BrailleDisplayDriver.check())
+		mockPump.assert_called_once_with(mockAvailable)
 
 	def test_addBleDevices_registration(self) -> None:
-		"""addBleDevices registers _isBleDotPad as the BLE match function."""
+		"""registerAutomaticDetection registers _isBleDotPad as the BLE match function."""
 		registrar = bdDetect.DriverRegistrar(BrailleDisplayDriver.name)
 		BrailleDisplayDriver.registerAutomaticDetection(registrar)
 		matchFunc = registrar._getDriverDict().get(bdDetect.CommunicationType.BLE)
-		self.assertIsNotNone(matchFunc)
-		self.assertTrue(callable(matchFunc))
+		self.assertEqual(matchFunc, BrailleDisplayDriver._isBleDotPad)
+
+	_ADDRESS = "AA:BB:CC:DD:EE:FF"
+
+	def _bleDriver(self) -> MagicMock:
+		"""Build a driver stub whose _tryConnect is the real implementation."""
+		driver = MagicMock(spec=BrailleDisplayDriver)
+		driver._receiveBuffer = bytearray()
+		driver._tryConnect = BrailleDisplayDriver._tryConnect.__get__(driver, type(driver))
+		# Device verification: report a text-capable DotPad board.
+		boardInfo = MagicMock()
+		boardInfo.features = DP_Features.HAS_TEXT_DISPLAY
+		driver._requestDeviceName = MagicMock(return_value="DotPad320")
+		driver._requestBoardInformation = MagicMock(return_value=boardInfo)
+		return driver
+
+	def _scannerWith(self, *devices: object):
+		"""Make the shared scanner report the given already-discovered devices."""
+		scanner = MagicMock()
+		scanner.results.return_value = list(devices)
+		return patch("hwIo.ble.scanner", scanner)
 
 	def test_tryConnect_bleDevice(self) -> None:
-		"""_tryConnect with a BLE device creates a hwIo.ble.Ble instance.
+		"""_tryConnect with a BLE port opens an hwIo.ble.Ble device and succeeds.
 
-		Requires hwIo.ble (PR A, #19838) and the _tryConnect BLE branch
-		(PR C). Will mock findDeviceByAddress, hwIo.ble.Ble,
-		_requestDeviceName, and _requestBoardInformation.
+		This runs on the main thread, as it does when the user picks a port in the
+		braille display selection dialog, so it also covers the device lookup being
+		safe to call there.
 		"""
+		driver = self._bleDriver()
+		bleDevice = MagicMock()
+		bleDevice.address = self._ADDRESS
+		with self._scannerWith(bleDevice), patch("hwIo.ble.Ble") as mockBle:
+			result = driver._tryConnect(
+				port=self._ADDRESS,
+				portType=bdDetect.ProtocolType.BLE,
+				portInfo={"address": self._ADDRESS},
+			)
+
+		self.assertTrue(result)
+		mockBle.assert_called_once()
+		# The scanner-provided device is passed through to the Ble transport.
+		self.assertEqual(mockBle.call_args.kwargs["device"], bleDevice)
+		self.assertEqual(mockBle.call_args.kwargs["onReceive"], driver._onReceive)
+		self.assertEqual(mockBle.call_args.kwargs["writeServiceUuid"], BLE_SERVICE_UUID)
+		self.assertEqual(mockBle.call_args.kwargs["writeCharacteristicUuid"], BLE_WRITE_CHARACTERISTIC_UUID)
+		self.assertEqual(mockBle.call_args.kwargs["readServiceUuid"], BLE_SERVICE_UUID)
+		self.assertEqual(mockBle.call_args.kwargs["readCharacteristicUuid"], BLE_READ_CHARACTERISTIC_UUID)
+		self.assertIs(driver._dev, mockBle.return_value)
+		driver._requestDeviceName.assert_called_once_with()
+		driver._requestBoardInformation.assert_called_once_with()
+
+	def test_tryConnect_pumpsMessagesWhenCalledFromGui(self) -> None:
+		"""A manual Bluetooth connection waits through the existing message-pumping helper."""
+		driver = self._bleDriver()
+		portInfo = {"address": self._ADDRESS}
+		with (
+			patch("brailleDisplayDrivers.dotPad.driver.wx.GetApp", return_value=object()),
+			patch("brailleDisplayDrivers.dotPad.driver.systemUtils.ExecAndPump") as mockPump,
+		):
+			mockPump.return_value.funcRes = True
+			self.assertTrue(driver._tryConnect(self._ADDRESS, bdDetect.ProtocolType.BLE, portInfo))
+		mockPump.assert_called_once_with(
+			driver._tryConnect, self._ADDRESS, bdDetect.ProtocolType.BLE, portInfo
+		)
+
+	def test_tryConnect_bleDeviceNotDiscovered(self) -> None:
+		"""_tryConnect falls back to the address when the scanner does not know the device."""
+		driver = self._bleDriver()
+		with self._scannerWith(), patch("hwIo.ble.Ble") as mockBle:
+			result = driver._tryConnect(
+				port=self._ADDRESS,
+				portType=bdDetect.ProtocolType.BLE,
+				portInfo={"address": self._ADDRESS},
+			)
+
+		self.assertTrue(result)
+		self.assertEqual(mockBle.call_args.kwargs["device"], self._ADDRESS)
+
+	def test_tryConnect_bleVerificationFailureClosesTransport(self) -> None:
+		"""A connection that fails DotPad verification does not leave an open transport."""
+		driver = self._bleDriver()
+		driver._requestBoardInformation.side_effect = RuntimeError("Invalid board information")
+		with self._scannerWith(), patch("hwIo.ble.Ble") as mockBle:
+			result = driver._tryConnect(self._ADDRESS, bdDetect.ProtocolType.BLE, {})
+		self.assertFalse(result)
+		mockBle.return_value.close.assert_called_once_with()
+		self.assertIsNone(driver._boardInformation)
+
+	def test_tryConnect_clearsStateFromPreviousConnection(self) -> None:
+		"""A reconnected display must receive output even when the cells are unchanged."""
+		driver = self._bleDriver()
+		driver._lastResponse = {0: object()}
+		driver._displayLineCache = {0: b"old cells"}
+		driver._receiveBuffer = bytearray(b"old packet")
+		with self._scannerWith(), patch("hwIo.ble.Ble"):
+			result = driver._tryConnect(self._ADDRESS, bdDetect.ProtocolType.BLE, {})
+		self.assertTrue(result)
+		self.assertEqual(driver._lastResponse, {})
+		self.assertEqual(driver._displayLineCache, {})
+		self.assertEqual(driver._receiveBuffer, bytearray())
+
+	def test_tryConnect_serialDeviceRemainsSupported(self) -> None:
+		"""USB serial devices keep using the serial transport and baud rate."""
+		driver = self._bleDriver()
+		with patch("hwIo.Serial") as mockSerial, patch("hwIo.ble.Ble") as mockBle:
+			result = driver._tryConnect("COM8", bdDetect.ProtocolType.SERIAL, {})
+		self.assertTrue(result)
+		mockBle.assert_not_called()
+		mockSerial.assert_called_once_with(
+			port="COM8",
+			baudrate=driver.SERIAL_BAUD_RATE,
+			parity=driver.SERIAL_PARITY,
+			timeout=driver.timeout,
+			writeTimeout=driver.timeout,
+			onReceive=driver._onReceive,
+		)

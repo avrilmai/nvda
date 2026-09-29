@@ -7,6 +7,10 @@
 ### New Features
 <!-- Note we are in a feature freeze, only features related to API breaking changes should be listed here -->
 
+* Dot Pad displays can now be connected via Bluetooth Low Energy (BLE) in addition to USB. (#19122, @bramd)
+  * When automatic detection is enabled for Dot Pad, devices will be discovered and connected automatically when in range.
+  * No Bluetooth pairing in Windows settings is required.
+
 ### Changes
 
 * The magnifier now follows what is being read when navigating in math expressions. (#20321, @CyrilleB79)
